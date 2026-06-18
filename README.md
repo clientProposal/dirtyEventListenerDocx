@@ -5,4 +5,4 @@
 4. npm run dev
 5. Make sure you have VITE_PDFTRONKEY=your_token in .env 
 
-Receive your_token (here)[https://dev.apryse.com/]
+Receive your token [here](https://dev.apryse.com/)
