@@ -60,7 +60,6 @@ export function attachDirtyTracker(instance, { onDirty, onSignal } = {}) {
     Promise.resolve(loadedPromise).then(arm).catch(arm);
   }
 
-  // --- 1. Annotation history ---
   function listenHistory(manager, event, source) {
     if (!manager) return;
     listen(manager, event, () => {
@@ -145,7 +144,7 @@ listen(documentViewer, 'documentLoaded', () => {
     reset: () => { dirty = false; },
     dispose: () => {
       for (const unsub of unsubs.splice(0)) {
-        try { unsub(); } catch (e) { /* ignore */ }
+        try { unsub(); } catch (e) {  }
       }
     },
   };
