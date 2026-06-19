@@ -13,7 +13,7 @@ function App() {
   const { VITE_PDFTRONKEY: licenseKey } = import.meta.env;
   const fullAPI = true;
 
-  const initialDoc = "docs/test.docx";
+  const initialDoc = "docs/provided-sample.docx";
 
   const path = '/webviewer/';
 
