@@ -1,29 +1,32 @@
-export function attachDirtyTracker(instance, { onDirty } = {}) {
+
+// 1. State and Utilities
+// Tracks dirty flag, armed state, and page settle status. Provides helper
+// functions for subscribing to events and marking the document as dirty.
+export function attachDirtyTracker(instance, { onDirty, onSignal } = {}) {
     let dirty = false;
-    let initialNoiseComplete = false;
-    let allPageLoaded = false;
-    let pageLoadTimer = null;
-    const PAGE_LOAD_TIMEOUT_MS = 2000;
-    const listenerCleanups = [];
+    let armed = false;
+    let pagesSettled = false;
+    let settleTimer = null;
+    const SETTLE_MS = 2000;
+    const unsubs = [];
 
     function listen(target, event, handler) {
         if (!target?.addEventListener) return;
         target.addEventListener(event, handler);
-        listenerCleanups.push(() => target.removeEventListener?.(event, handler));
+        unsubs.push(() => target.removeEventListener?.(event, handler));
     }
 
     function markDirty(source) {
         if (dirty) return;
-        if (!initialNoiseComplete) return;
+        if (!armed) return;
         dirty = true;
         onDirty?.(source);
     }
 
-    // Search for annotations coming from document, not current session
-    function isAnnotationFromOtherSession(annotation) {
-        // Search for annotations coming from document, not current session. 
-        // OFFICE_EDITOR_TRACKED_CHANGE_KEY, OFFICE_EDITOR_COMMENT_KEY, TrackedChange, Comment
-
+    // 2. Office Annotation Filter
+    // Identifies annotations created internally by the Office Editor for
+    // tracked changes and comments, so they can be excluded from dirty checks.
+    function isOfficeEditorAnnotation(annotation) {
         if (!annotation) return false;
         try {
             const customData = annotation.getCustomData?.('OFFICE_EDITOR_TRACKED_CHANGE_KEY')
@@ -37,14 +40,10 @@ export function attachDirtyTracker(instance, { onDirty } = {}) {
         return false;
     }
 
+    // 3. Page Update Handler
+    // Ignores pagesUpdated events during initial document rendering by waiting
+    // for a settle period. Only flags dirty after all pages have loaded.
     function handlePagesUpdated(payload) {
-        // Reset timer, more pages still to come
-        if (!allPageLoaded) {
-            if (pageLoadTimer) clearTimeout(pageLoadTimer);
-            pageLoadTimer = setTimeout(() => { allPageLoaded = true; }, PAGE_LOAD_TIMEOUT_MS);
-            return;
-        }
-
         const changes = payload && typeof payload === 'object' ? payload : {};
         const added = changes.added?.length ?? 0;
         const removed = changes.removed?.length ?? 0;
@@ -52,6 +51,12 @@ export function attachDirtyTracker(instance, { onDirty } = {}) {
         const moved = changes.moved && typeof changes.moved === 'object'
             ? Object.keys(changes.moved).length
             : 0;
+
+        if (!pagesSettled) {
+            if (settleTimer) clearTimeout(settleTimer);
+            settleTimer = setTimeout(() => { pagesSettled = true; }, SETTLE_MS);
+            return;
+        }
 
         if (added > 0 || removed > 0 || rotated > 0 || moved > 0) {
             markDirty('pagesUpdated');
@@ -62,24 +67,30 @@ export function attachDirtyTracker(instance, { onDirty } = {}) {
     const documentViewer = Core?.documentViewer;
     const annotationManager = Core?.annotationManager;
 
-    // Nothing dirty until markInitialNoiseAsComplete() has been called after initial load settles.
-    function markInitialNoiseAsComplete() {
-        if (initialNoiseComplete) return;
+    // 4. Arming Mechanism
+    // Clears the annotation history and enables dirty tracking. Nothing is
+    // flagged as dirty until arm() has been called after initial load settles.
+    function arm() {
+        if (armed) return;
         try {
             documentViewer?.getAnnotationHistoryManager?.()?.clear?.();
         } catch (e) { console.log(e); }
-        initialNoiseComplete = true;
+        armed = true;
     }
 
-    // Filter out irreversible actions and mark remaining ones as dirty
-    function markReversibleDirtyInHistManager(manager, event, source) {
+    // 5. History Manager Listeners
+    // Watches annotation and content edit history managers. Only marks dirty
+    // when there is an undoable action, filtering out initial load noise.
+    function listenHistory(manager, event, source) {
         if (!manager) return;
         listen(manager, event, () => {
             if (manager.canUndo?.()) markDirty(source);
         });
     }
-    // Subscribe to pagesUpdated, fieldChanged, annotationChanged, and
-    // outlineBookmarksChanged. Filter out imported annotations, + those coming from document.
+
+    // 6. Core Event Listeners
+    // Subscribes to pagesUpdated, fieldChanged, annotationChanged, and
+    // outlineBookmarksChanged. Filters out imported and Office Editor annotations.
     listen(documentViewer, 'pagesUpdated', (...args) => handlePagesUpdated(args[0]));
 
     listen(annotationManager, 'fieldChanged', () => markDirty('fieldChanged'));
@@ -90,7 +101,7 @@ export function attachDirtyTracker(instance, { onDirty } = {}) {
         const imported = info?.imported ?? false;
 
         const userAnnotations = Array.isArray(annotations)
-            ? annotations.filter(a => !isAnnotationFromOtherSession(a))
+            ? annotations.filter(a => !isOfficeEditorAnnotation(a))
             : annotations;
 
         if (!userAnnotations || userAnnotations.length === 0) return;
@@ -107,38 +118,46 @@ export function attachDirtyTracker(instance, { onDirty } = {}) {
 
     listen(UI, 'outlineBookmarksChanged', () => markDirty('outlineBookmarksChanged'));
 
+    // 7. Document Loaded Handler
+    // Resets state on each new document. Uses a settle timer to defer arming
+    // until all initial page rendering and annotation syncing has completed.
     listen(documentViewer, 'documentLoaded', () => {
-        allPageLoaded = false;
-        initialNoiseComplete = false;
-        if (pageLoadTimer) clearTimeout(pageLoadTimer);
+        pagesSettled = false;
+        armed = false;
+        if (settleTimer) clearTimeout(settleTimer);
 
         const initialPageCount = documentViewer?.getPageCount?.() ?? 0;
 
-        const completeNoiseAfterSettle = () => {
-            allPageLoaded = true;
+        const armAfterSettle = () => {
+            pagesSettled = true;
             try {
                 documentViewer?.getAnnotationHistoryManager?.()?.clear?.();
             } catch (e) { console.log(e); }
-            markInitialNoiseAsComplete();
+            arm();
         };
 
         if (initialPageCount > 0) {
-            pageLoadTimer = setTimeout(completeNoiseAfterSettle, PAGE_LOAD_TIMEOUT_MS);
+            settleTimer = setTimeout(armAfterSettle, SETTLE_MS);
         }
 
-        // Only fresh history
-        markReversibleDirtyInHistManager(
+        // 8. History Wiring Post-Load
+        // Attaches history listeners after documentLoaded to get fresh manager
+        // references. Covers both annotation history and content edit history.
+        listenHistory(
             documentViewer?.getAnnotationHistoryManager?.(),
             'historyChanged',
             'annotationHistory'
         );
 
-        markReversibleDirtyInHistManager(
+        listenHistory(
             documentViewer?.getContentEditHistoryManager?.(),
             'undoRedoStatusChanged',
             'contentEdit'
         );
 
+        // 9. Office Editor Listener
+        // Listens for officeDocumentEdited on both the document and the Office
+        // Editor instance. Wrapped in try-catch as it throws for spreadsheets.
         try {
             const doc = documentViewer?.getDocument?.();
             const officeEditor = doc?.getOfficeEditor?.();
@@ -151,6 +170,9 @@ export function attachDirtyTracker(instance, { onDirty } = {}) {
             }
         } catch (e) { console.log(e); }
 
+        // 10. Spreadsheet Editor Listener
+        // Waits for SPREADSHEET_EDITOR_READY then wires all edit-related events
+        // from the Events enum, skipping non-edit events that fire during load.
         const SpreadsheetEditor = Core?.SpreadsheetEditor;
         const SEEvents = SpreadsheetEditor?.SpreadsheetEditorManager?.Events;
         const spreadsheetManager = documentViewer?.getSpreadsheetEditorManager?.();
@@ -170,34 +192,40 @@ export function attachDirtyTracker(instance, { onDirty } = {}) {
                     for (const [name, value] of Object.entries(SEEvents)) {
                         if (skipEvents.has(name)) continue;
                         spreadsheetManager.addEventListener(value, () => markDirty(`spreadsheet:${name}`));
-                        listenerCleanups.push(() => {
+                        unsubs.push(() => {
                             try { spreadsheetManager.removeEventListener?.(value); } catch (e) { console.log(e); }
                         });
                     }
                 });
-                listenerCleanups.push(() => {
+                unsubs.push(() => {
                     try { spreadsheetManager.removeEventListener?.(readyEvent); } catch (e) { console.log(e); }
                 });
             }
         }
     });
 
+    // 11. Deferred Page Settle
+    // Second pagesUpdated listener for Office Editor documents where page count
+    // is zero at documentLoaded. Arms the tracker once page events stop arriving.
     listen(documentViewer, 'pagesUpdated', (...args) => {
-        if (!allPageLoaded && !initialNoiseComplete) {
-            if (pageLoadTimer) clearTimeout(pageLoadTimer);
-            pageLoadTimer = setTimeout(() => {
-                allPageLoaded = true;
-                markInitialNoiseAsComplete();
-            }, PAGE_LOAD_TIMEOUT_MS);
+        if (!pagesSettled && !armed) {
+            if (settleTimer) clearTimeout(settleTimer);
+            settleTimer = setTimeout(() => {
+                pagesSettled = true;
+                arm();
+            }, SETTLE_MS);
         }
     });
 
+    // 12. Public API
+    // Returns isDirty to check state, reset to clear after saving, and dispose
+    // to remove all event listeners and clear timers on unmount.
     return {
         isDirty: () => dirty,
         reset: () => { dirty = false; },
         dispose: () => {
-            if (pageLoadTimer) clearTimeout(pageLoadTimer);
-            for (const unsub of listenerCleanups.splice(0)) {
+            if (settleTimer) clearTimeout(settleTimer);
+            for (const unsub of unsubs.splice(0)) {
                 try { unsub(); } catch (e) { console.log(e); }
             }
         },
